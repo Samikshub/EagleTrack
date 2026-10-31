@@ -4,4 +4,3 @@ __pycache__/
 .streamlit/secrets.toml
 *.db*
 .agents/
-!portfolio.db

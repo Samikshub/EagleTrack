@@ -20,6 +20,7 @@ NY = ZoneInfo("America/New_York")
 TEAMS = [f"{g}-{i}" for g in ("A", "B") for i in range(1, 6)] + ["Prof Balch"]
 GROUPS = ["Group A", "Group B", "Reference"]
 DEFAULT_COLUMNS = ["group_name", "team", "ticker", "side", "shares", "entry_price", "entry_date"]
+STARTING_POSITIONS_PATH = APP_DIR / "starting_positions.csv"
 YAHOO_SYMBOLS = {"BF.B": "BF-B", "RHM": "RHM.DE", "SOX": "^SOX", "VW": "VWAGY"}
 EUR_TICKERS = {"RHM"}
 REFRESH_LOCK = threading.Lock()
@@ -81,6 +82,30 @@ def init_db() -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
             as_of TEXT NOT NULL, group_name TEXT NOT NULL, team TEXT NOT NULL,
             equity REAL NOT NULL, pnl REAL NOT NULL)""")
+        # Seed a fresh local/cloud database once from the version-controlled
+        # starting file. The flag prevents intentionally cleared positions from
+        # being silently restored on every Streamlit rerun.
+        seed_marker = conn.execute(
+            "SELECT value FROM settings WHERE key='starting_positions_seeded'"
+        ).fetchone()
+        if seed_marker is None:
+            position_count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+            if position_count == 0 and STARTING_POSITIONS_PATH.exists():
+                starting_positions = pd.read_csv(STARTING_POSITIONS_PATH)
+                missing_columns = set(DEFAULT_COLUMNS) - set(starting_positions.columns)
+                if missing_columns:
+                    raise ValueError(
+                        "starting_positions.csv is missing columns: "
+                        + ", ".join(sorted(missing_columns))
+                    )
+                if not starting_positions.empty:
+                    starting_positions[DEFAULT_COLUMNS].to_sql(
+                        "positions", conn, if_exists="append", index=False
+                    )
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("starting_positions_seeded", "1"),
+            )
 
 
 def get_positions() -> pd.DataFrame:
