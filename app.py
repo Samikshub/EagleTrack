@@ -21,6 +21,7 @@ TEAMS = [f"{g}-{i}" for g in ("A", "B") for i in range(1, 6)] + ["Prof Balch"]
 GROUPS = ["Group A", "Group B", "Reference"]
 DEFAULT_COLUMNS = ["group_name", "team", "ticker", "side", "shares", "entry_price", "entry_date"]
 STARTING_POSITIONS_PATH = APP_DIR / "starting_positions.csv"
+SP500_TICKER = "^GSPC"
 YAHOO_SYMBOLS = {"BF.B": "BF-B", "RHM": "RHM.DE", "SOX": "^SOX", "VW": "VWAGY"}
 EUR_TICKERS = {"RHM"}
 REFRESH_LOCK = threading.Lock()
@@ -245,6 +246,29 @@ def get_saved_prices(tickers: list[str]) -> tuple[dict[str, float], dict[str, st
     return marks, quote_dates, settings.get("last_refresh_date", "Unknown date"), settings.get("last_refresh_status", "No refresh yet")
 
 
+def get_or_fetch_start_price(ticker: str, quote_day: str) -> float | None:
+    """Return the saved close for a ticker on its benchmark start date."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT price_usd FROM price_snapshots WHERE ticker=? AND quote_date=?",
+            (ticker, quote_day),
+        ).fetchone()
+    if row:
+        return float(row[0])
+
+    historical_prices, _ = get_price_data([ticker], as_of=quote_day)
+    value = historical_prices.get(ticker)
+    if value is None:
+        return None
+    fetched_at = datetime.now(NY).isoformat(timespec="seconds")
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO price_snapshots VALUES (?, ?, ?, ?)",
+            (ticker, quote_day, value, fetched_at),
+        )
+    return float(value)
+
+
 def refresh_daily_prices(force: bool = False) -> tuple[int, str]:
     """Persist the latest completed daily close once each New York morning."""
     with REFRESH_LOCK:
@@ -254,7 +278,9 @@ def refresh_daily_prices(force: bool = False) -> tuple[int, str]:
             if not force and last and last[0] == today.isoformat():
                 return 0, "Already refreshed today"
         allocations = pd.read_csv(APP_DIR / "allocations.csv")
-        tickers = sorted(set(allocations["ticker"].tolist()) | set(get_positions().get("ticker", pd.Series(dtype=str)).tolist()))
+        tickers = sorted(set(allocations["ticker"].tolist()) |
+                         set(get_positions().get("ticker", pd.Series(dtype=str)).tolist()) |
+                         {SP500_TICKER})
         try:
             closes = download_daily_closes(tickers, start=(today - timedelta(days=12)).isoformat(),
                                            end=(today + timedelta(days=1)).isoformat())
@@ -311,12 +337,14 @@ def start_daily_refresh_worker():
 def calculate_positions(raw: pd.DataFrame, prices: dict[str, float]) -> pd.DataFrame:
     if raw.empty:
         return raw.assign(current_price=pd.Series(dtype=float), market_value=pd.Series(dtype=float),
-                          unrealized_pnl=pd.Series(dtype=float))
+                          unrealized_pnl=pd.Series(dtype=float), position_return_pct=pd.Series(dtype=float))
     df = raw.copy()
     df["current_price"] = df["ticker"].map(prices)
     direction = df["side"].map({"Long": 1, "Short": -1})
     df["market_value"] = df["shares"] * df["current_price"]
     df["unrealized_pnl"] = (df["current_price"] - df["entry_price"]) * df["shares"] * direction
+    entry_notional = df["shares"] * df["entry_price"]
+    df["position_return_pct"] = (df["unrealized_pnl"] / entry_notional * 100).where(df["shares"] != 0)
     df["signed_exposure"] = df["market_value"] * direction
     df["price_available"] = df["current_price"].notna()
     return df
@@ -340,16 +368,20 @@ st.title("EagleTrack - Portfolio Tracker")
 st.caption("Read-only portfolio dashboard • Contact Sam for any changes.")
 raw = get_positions()
 all_tickers = sorted(set(pd.read_csv(APP_DIR / "allocations.csv")["ticker"].tolist()) |
-                     set(raw["ticker"].tolist() if not raw.empty else []))
+                     set(raw["ticker"].tolist() if not raw.empty else []) |
+                     {SP500_TICKER})
 last_refresh_date = ""
 with connect() as conn:
     row = conn.execute("SELECT value FROM settings WHERE key='last_refresh_date'").fetchone()
     last_refresh_date = row[0] if row else ""
-if not get_saved_prices(all_tickers)[0] or (
-    datetime.now(NY).time() >= wall_time(8, 0) and last_refresh_date != datetime.now(NY).date().isoformat()
-):
+saved_prices = get_saved_prices(all_tickers)[0]
+if not saved_prices or SP500_TICKER not in saved_prices:
+    # Force a refresh if a newly added benchmark is missing despite today's marker.
+    refresh_daily_prices(force=last_refresh_date == datetime.now(NY).date().isoformat())
+elif datetime.now(NY).time() >= wall_time(8, 0) and last_refresh_date != datetime.now(NY).date().isoformat():
     refresh_daily_prices()
 prices, quote_dates, refresh_date, refresh_status = get_saved_prices(all_tickers)
+sp500_start_price = get_or_fetch_start_price(SP500_TICKER, ENTRY_DATE)
 df = calculate_positions(raw, prices)
 if not df.empty:
     df["quote_date"] = df["ticker"].map(quote_dates)
@@ -375,6 +407,7 @@ if not zero_allocations.empty:
     zero_rows["current_price"] = zero_rows["ticker"].map(prices)
     zero_rows["market_value"] = 0.0
     zero_rows["unrealized_pnl"] = 0.0
+    zero_rows["position_return_pct"] = 0.0
     zero_rows["signed_exposure"] = 0.0
     zero_rows["price_available"] = zero_rows["current_price"].notna()
     zero_rows["quote_date"] = zero_rows["ticker"].map(quote_dates)
@@ -410,7 +443,7 @@ else:
     ranked_summaries.sort(key=lambda item: item[1], reverse=True)
     summary_badges = {name: (("🥇", "1st"), ("🥈", "2nd"), ("🥚", "3rd"))[rank]
                       for rank, (name, _) in enumerate(ranked_summaries)}
-    tiles = st.columns(4, border=True)
+    tiles = st.columns(5, border=True)
     def pnl_display(value: float) -> str:
         color = "green" if value >= 0 else "red"
         return f":{color}[${value:,.2f}]"
@@ -434,6 +467,18 @@ else:
     render_summary_tile(tiles[1], "Group A performance", group_a_pnl, 100_000, summary_badges["Group A"])
     render_summary_tile(tiles[2], "Group B performance", group_b_pnl, 100_000, summary_badges["Group B"])
     render_summary_tile(tiles[3], "Prof Balch P/L", reference_pnl, 20_000, summary_badges["Prof Balch"])
+    sp500_current_price = prices.get(SP500_TICKER)
+    if sp500_start_price and sp500_current_price:
+        sp500_return_pct = (sp500_current_price / sp500_start_price - 1) * 100
+        sp500_color = "green" if sp500_return_pct >= 0 else "red"
+        tiles[4].metric(
+            "S&P 500 performance",
+            f":{sp500_color}[{sp500_return_pct:+.2f}%]",
+            f"{sp500_start_price:,.2f} → {sp500_current_price:,.2f} points",
+            delta_color="off",
+        )
+    else:
+        tiles[4].metric("S&P 500 performance", "Unavailable", "Waiting for both close prices", delta_color="off")
     st.caption(f"P/L since October 27, 2026 close • Price data refreshed {refresh_date}. Reference portfolio is excluded from group and overall totals.")
 
     for group in ("Group A", "Group B"):
@@ -446,16 +491,17 @@ else:
                 for portfolio in team_df["portfolio"].dropna().unique():
                     holdings = team_df[team_df["portfolio"] == portfolio]
                     st.subheader(f"{portfolio} portfolio")
-                    view = holdings[["ticker", "side", "allocation_pct", "shares", "entry_price", "current_price", "quote_date", "unrealized_pnl"]].copy().reset_index(drop=True)
+                    view = holdings[["ticker", "side", "allocation_pct", "shares", "entry_price", "current_price", "quote_date", "unrealized_pnl", "position_return_pct"]].copy().reset_index(drop=True)
                     view = view.rename(columns={"ticker": "Asset", "side": "Position", "allocation_pct": "Allocation (%)", "shares": "Shares",
                         "entry_price": "Entry price (Oct 27 close)", "current_price": "Latest price (USD)",
-                        "quote_date": "Price date", "unrealized_pnl": "P/L (USD)"})
+                        "quote_date": "Price date", "unrealized_pnl": "P/L (USD)", "position_return_pct": "Position return (%)"})
                     st.dataframe(style_holdings_table(view), hide_index=True, row_height=44, column_config={
                         "Allocation (%)": st.column_config.NumberColumn(format="%g%%"),
                         "Shares": st.column_config.NumberColumn(format="%.4f"),
                         "Entry price (Oct 27 close)": st.column_config.NumberColumn(format="$%.2f"),
                         "Latest price (USD)": st.column_config.NumberColumn(format="$%.2f"),
-                        "P/L (USD)": st.column_config.NumberColumn(format="$%.2f")})
+                        "P/L (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                        "Position return (%)": st.column_config.NumberColumn(format="%+.2f%%")})
 
     reference = df[df["group_name"] == "Reference"]
     if not reference.empty:
@@ -464,15 +510,17 @@ else:
             holdings = reference[reference["portfolio"] == portfolio]
             portfolio_pnl = holdings["unrealized_pnl"].sum()
             with st.expander(f"{portfolio} portfolio · P/L ${portfolio_pnl:,.2f}", expanded=True):
-                view = holdings[["ticker", "side", "allocation_pct", "shares", "entry_price", "current_price", "quote_date", "unrealized_pnl"]].reset_index(drop=True).rename(columns={
+                view = holdings[["ticker", "side", "allocation_pct", "shares", "entry_price", "current_price", "quote_date", "unrealized_pnl", "position_return_pct"]].reset_index(drop=True).rename(columns={
                     "ticker": "Asset", "side": "Position", "allocation_pct": "Allocation (%)", "shares": "Shares", "entry_price": "Entry price (Oct 27 close)",
-                    "current_price": "Latest price (USD)", "quote_date": "Price date", "unrealized_pnl": "P/L (USD)"})
+                    "current_price": "Latest price (USD)", "quote_date": "Price date", "unrealized_pnl": "P/L (USD)",
+                    "position_return_pct": "Position return (%)"})
                 st.dataframe(style_holdings_table(view), hide_index=True, row_height=44, column_config={
                     "Allocation (%)": st.column_config.NumberColumn(format="%g%%"),
                     "Shares": st.column_config.NumberColumn(format="%.4f"),
                     "Entry price (Oct 27 close)": st.column_config.NumberColumn(format="$%.2f"),
                     "Latest price (USD)": st.column_config.NumberColumn(format="$%.2f"),
-                    "P/L (USD)": st.column_config.NumberColumn(format="$%.2f")})
+                    "P/L (USD)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Position return (%)": st.column_config.NumberColumn(format="%+.2f%%")})
 
 if is_admin:
     st.sidebar.divider()
