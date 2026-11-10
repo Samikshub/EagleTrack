@@ -107,6 +107,21 @@ def init_db() -> None:
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 ("starting_positions_seeded", "1"),
             )
+        # ITA had a 3-for-1 split effective 2026-11-05. Convert pre-split
+        # saved positions once so old databases use the same share/price units
+        # as post-split Yahoo quotes and the split-adjusted seed file.
+        ita_split_marker = conn.execute(
+            "SELECT value FROM settings WHERE key='ita_split_2026_11_05_adjusted'"
+        ).fetchone()
+        if ita_split_marker is None:
+            conn.execute(
+                "UPDATE positions SET shares=shares*3, entry_price=entry_price/3 "
+                "WHERE ticker='ITA' AND entry_date < '2026-11-05' AND entry_price > 150"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("ita_split_2026_11_05_adjusted", "1"),
+            )
 
 
 def get_positions() -> pd.DataFrame:
